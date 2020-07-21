@@ -439,6 +439,7 @@ func New(options ...AgentOption) (*Agent, error) {
 		endpoints:       make(map[string]string),
 		tokens:          new(token.Store),
 		logger:          flat.logger,
+		cache:           cache.New(nil),
 	}
 
 	// parse the configuration and handle the error/warnings
@@ -525,14 +526,34 @@ func New(options ...AgentOption) (*Agent, error) {
 		return nil, fmt.Errorf("Failed to setup node ID: %v", err)
 	}
 
-	acOpts := []autoconf.Option{
-		autoconf.WithDirectRPC(a.connPool),
-		autoconf.WithTLSConfigurator(a.tlsConfigurator),
-		autoconf.WithBuilderOpts(flat.builderOpts),
-		autoconf.WithLogger(a.logger),
-		autoconf.WithOverrides(flat.overrides...),
+	// We used to do this in the Start method. However it doesn't need to go
+	// there any longer. Originally it did because we passed the agent
+	// delegate to some of the cache registrations. Now we just
+	// pass the agent itself so its safe to move here.
+	a.registerCache()
+
+	cmConf := new(certmon.Config).
+		WithCache(a.cache).
+		WithTLSConfigurator(a.tlsConfigurator).
+		WithDNSSANs(a.config.AutoConfig.DNSSANs).
+		WithIPSANs(a.config.AutoConfig.IPSANs).
+		WithDatacenter(a.config.Datacenter).
+		WithNodeName(a.config.NodeName).
+		WithFallback(a.autoConfigFallbackTLS).
+		WithLogger(a.logger.Named(logging.AutoConfig)).
+		WithTokens(a.tokens)
+	acCertMon, err := certmon.New(cmConf)
+	if err != nil {
+		return nil, err
 	}
-	ac, err := autoconf.New(acOpts...)
+
+	acConf := new(autoconf.Config).
+		WithDirectRPC(a.connPool).
+		WithBuilderOpts(flat.builderOpts).
+		WithLogger(a.logger).
+		WithOverrides(flat.overrides...).
+		WithCertMonitor(acCertMon)
+	ac, err := autoconf.New(acConf)
 	if err != nil {
 		return nil, err
 	}
@@ -663,9 +684,6 @@ func (a *Agent) Start(ctx context.Context) error {
 	// regular and on-demand state synchronizations (anti-entropy).
 	a.sync = ae.NewStateSyncer(a.State, c.AEInterval, a.shutdownCh, a.logger)
 
-	// create the cache
-	a.cache = cache.New(nil)
-
 	// create the config for the rpc server/client
 	consulCfg, err := a.consulConfig()
 	if err != nil {
@@ -714,10 +732,6 @@ func (a *Agent) Start(ctx context.Context) error {
 	a.State.Delegate = a.delegate
 	a.State.TriggerSyncChanges = a.sync.SyncChanges.Trigger
 
-	// Register the cache. We do this much later so the delegate is
-	// populated from above.
-	a.registerCache()
-
 	if a.config.AutoEncryptTLS && !a.config.ServerMode {
 		reply, err := a.autoEncryptInitialCertificate(ctx)
 		if err != nil {
@@ -755,6 +769,9 @@ func (a *Agent) Start(ctx context.Context) error {
 		a.logger.Info("automatically upgraded to TLS")
 	}
 
+	if err := a.autoConf.Start(&lib.StopChannelContext{StopCh: a.shutdownCh}); err != nil {
+		return fmt.Errorf("AutoConf failed to start certificate monitor: %w", err)
+	}
 	a.serviceManager.Start()
 
 	// Load checks/services/metadata.
@@ -865,6 +882,10 @@ func (a *Agent) autoEncryptInitialCertificate(ctx context.Context) (*structs.Sig
 	addrs = append(addrs, retryJoinAddrs(disco, retryJoinSerfVariant, "LAN", a.config.RetryJoinLAN, a.logger)...)
 
 	return client.RequestAutoEncryptCerts(ctx, addrs, a.config.ServerPort, a.tokens.AgentToken(), a.config.AutoEncryptDNSSAN, a.config.AutoEncryptIPSAN)
+}
+
+func (a *Agent) autoConfigFallbackTLS(ctx context.Context) (*structs.SignedResponse, error) {
+	return a.autoConf.FallbackTLS(ctx)
 }
 
 func (a *Agent) listenAndServeGRPC() error {
@@ -1826,6 +1847,16 @@ func (a *Agent) ShutdownAgent() error {
 	a.logger.Info("Requesting shutdown")
 	// Stop the watches to avoid any notification/state change during shutdown
 	a.stopAllWatches()
+
+	// this would be cancelled anyways (by the closing of the shutdown ch) but
+	// this should help them to be stopped more quickly
+	a.autoConf.Stop()
+
+	if a.certMonitor != nil {
+		// this would be cancelled anyways  (by the closing of the shutdown ch)
+		// but this should help them to be stopped more quickly
+		a.certMonitor.Stop()
+	}
 
 	// Stop the service manager (must happen before we take the stateLock to avoid deadlock)
 	if a.serviceManager != nil {

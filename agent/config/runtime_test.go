@@ -7449,12 +7449,6 @@ func TestConnectCAConfiguration(t *testing.T) {
 	}
 
 	cases := map[string]testCase{
-		"connect-disabled": {
-			config: RuntimeConfig{
-				ConnectEnabled: false,
-			},
-			expected: nil,
-		},
 		"defaults": {
 			config: RuntimeConfig{
 				ConnectEnabled: true,
